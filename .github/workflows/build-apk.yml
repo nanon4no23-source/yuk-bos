@@ -1,0 +1,175 @@
+name: Build Android APK (Capacitor)
+
+# Workflow otomatis build APK Android untuk aplikasi Kasir (com.srcmasngud.kasir)
+# Menggunakan Java JDK 21 sesuai kebutuhan Capacitor 7 (Android SDK 34/35)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
+      - 'LICENSE'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Pilih tipe APK yang akan di-build (debug, release, atau both)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+          - both
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 1b. Deteksi & Selaraskan Struktur Folder Proyek
+        run: |
+          echo "=== 1. CEK STRUKTUR REPOSITORY AWAL ==="
+          ls -la
+          
+          # Jika isi proyek berada di dalam subfolder root (misal hasil unzip)
+          TARGET_DIR="."
+          if [ ! -f "package.json" ]; then
+            SUBDIR=$(find . -maxdepth 2 -type f -name "package.json" -exec dirname {} \; | head -n 1)
+            if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "." ]; then
+              echo "Mendeteksi package.json di subdirektori: $SUBDIR"
+              echo "Memindahkan semua file dari $SUBDIR ke root repository..."
+              shopt -s dotglob
+              mv "$SUBDIR"/* . || true
+              shopt -u dotglob
+            fi
+          fi
+
+          if [ ! -f "package.json" ]; then
+            echo "::error::package.json tidak ditemukan di root repositori!"
+            exit 1
+          fi
+          echo "Konfirmasi: package.json ditemukan di root."
+
+      - name: 2. Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: 3. Setup Java JDK 21 (Capacitor 7 Requirement)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: 4. Setup Android SDK Environment
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Install Dependencies Proyek
+        run: |
+          echo "Menginstall dependensi NPM..."
+          if [ -f "package-lock.json" ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+      - name: 6. Build Web Assets (Vite)
+        run: |
+          echo "Menjalankan build Vite ke folder dist/..."
+          npm run build
+          if [ ! -d "dist" ] || [ ! -f "dist/index.html" ]; then
+            echo "::error::Folder dist/ atau dist/index.html tidak terbentuk!"
+            exit 1
+          fi
+          echo "Build web aset sukses."
+
+      - name: 7. Inisialisasi & Sinkronisasi Proyek Android Capacitor
+        run: |
+          echo "Memeriksa folder platform android/..."
+          if [ ! -d "android" ]; then
+            echo "Folder android belum ada, menambahkan platform android via Capacitor CLI..."
+            npx cap add android
+          fi
+          
+          echo "Menyinkronkan aset web dist ke platform android..."
+          npx cap sync android
+
+      - name: 8. Verifikasi & Berikan Hak Eksekusi Gradle Wrapper
+        run: |
+          if [ ! -f "android/gradlew" ]; then
+            echo "::error::File android/gradlew tidak ditemukan!"
+            exit 1
+          fi
+          chmod +x android/gradlew
+          echo "Gradle wrapper siap dieksekusi."
+
+      - name: 9. Cache Gradle Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 10a. Build APK Debug
+        if: ${{ github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == null }}
+        run: |
+          echo "Memulai kompilasi APK Debug..."
+          cd android
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          cd ..
+          
+          echo "Verifikasi hasil APK Debug:"
+          ls -la android/app/build/outputs/apk/debug/
+
+      - name: 10b. Build APK Release (Unsigned)
+        if: ${{ github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' }}
+        run: |
+          echo "Memulai kompilasi APK Release (Unsigned)..."
+          cd android
+          ./gradlew assembleRelease --stacktrace --no-daemon
+          cd ..
+          
+          echo "Verifikasi hasil APK Release:"
+          ls -la android/app/build/outputs/apk/release/
+
+      - name: 11a. Unggah Artifact APK Debug (Bisa Langsung Diunduh)
+        if: ${{ github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == null }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: 11b. Unggah Artifact APK Release
+        if: ${{ github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-unsigned-apk
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          retention-days: 30
+
+      - name: 12. Ringkasan Build APK Berhasil
+        run: |
+          echo "### 🚀 Build APK Android Berhasil!" >> $GITHUB_STEP_SUMMARY
+          echo "- **App ID**: \`com.srcmasngud.kasir\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Java Version**: JDK 21" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: Selesai" >> $GITHUB_STEP_SUMMARY
+          echo "File APK dapat diunduh langsung di tab **Artifacts** pada halaman workflow run ini." >> $GITHUB_STEP_SUMMARY
